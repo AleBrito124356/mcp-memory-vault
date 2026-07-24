@@ -1,0 +1,12 @@
+[project]
+name = "mcp-memory-vault"
+version = "0.1.0"
+description = "MCP server that gives any agent persistent memory — namespaced facts with tags, SQLite FTS5 full-text search, TTL expiry and zero external dependencies."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Alejandro Brito", email = "alejandrobritoolivera@gmail.com"}]
+dependencies = ["mcp>=1.2.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
