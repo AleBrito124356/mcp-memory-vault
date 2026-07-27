@@ -1,14 +1,14 @@
 """mcp-memory-vault — MCP server that gives any agent persistent memory.
 
 Entry point: FastMCP wiring only. All logic lives in core.py (pure stdlib).
-Run with: python server.py  (stdio transport)
+Run with: python -m mcp_memory_vault.server  (stdio transport)
 """
 
 from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
-from core import MemoryVault
+from .core import MemoryVault
 
 mcp = FastMCP("mcp-memory-vault")
 vault = MemoryVault()
@@ -177,5 +177,10 @@ def import_memories(memories: list[dict]) -> dict:
     return vault.import_memories(memories=memories)
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Entry point for the console script."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

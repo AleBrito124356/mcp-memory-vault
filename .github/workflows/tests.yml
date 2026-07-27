@@ -19,5 +19,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install pytest
+      - run: pip install -e ".[dev]"
       - run: python -m pytest -q
+      - name: Verify the server module imports
+        run: python -c "from mcp_memory_vault import server; print('import ok')"

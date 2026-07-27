@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "mcp-memory-vault"
 version = "0.1.0"
@@ -6,7 +10,31 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "Alejandro Brito", email = "alejandrobritoolivera@gmail.com"}]
+keywords = ["mcp", "model-context-protocol", "claude", "ai-agents", "memory", "sqlite", "fts5"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Database",
+]
 dependencies = ["mcp>=1.2.0"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+
+[project.urls]
+Homepage = "https://github.com/AleBrito124356/mcp-memory-vault"
+Source = "https://github.com/AleBrito124356/mcp-memory-vault"
+Issues = "https://github.com/AleBrito124356/mcp-memory-vault/issues"
+
+[project.scripts]
+mcp-memory-vault = "mcp_memory_vault.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mcp_memory_vault"]

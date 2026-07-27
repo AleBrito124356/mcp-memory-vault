@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core import MemoryVault  # noqa: E402
+from mcp_memory_vault.core import MemoryVault  # noqa: E402
 
 
 @pytest.fixture

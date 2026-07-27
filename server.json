@@ -1,0 +1,29 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.AleBrito124356/mcp-memory-vault",
+  "title": "Memory Vault",
+  "description": "Persistent memory for agents: namespaced facts, tags, SQLite FTS5 search and TTL expiry.",
+  "version": "0.1.0",
+  "repository": {
+    "url": "https://github.com/AleBrito124356/mcp-memory-vault",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "mcp-memory-vault",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": {"type": "stdio"},
+      "environmentVariables": [
+        {
+          "name": "MEMORY_VAULT_DB",
+          "description": "Path to the SQLite database file. Defaults to ~/.mcp-memory-vault/memories.db",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}
