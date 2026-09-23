@@ -141,11 +141,12 @@ def remember(
 
     Use this whenever you learn something worth keeping: user preferences,
     project decisions, environment quirks, follow-ups. Exact duplicates
-    (same content in the same namespace) are detected and returned with
-    "deduplicated": true instead of being stored twice.
+    (same content in the same namespace) are never stored twice: the
+    existing memory is returned with "deduplicated": true, and any new tags
+    are merged into it (listed in "merged_tags"). Tags are case-insensitive.
 
     Returns the stored memory (id, content, namespace, tags, timestamps) plus
-    "deduplicated" and a human-readable "message".
+    "deduplicated", "merged_tags" and a human-readable "message".
     """
     return _call(
         "remember",
@@ -236,8 +237,22 @@ def update_memory(
         int,
         Field(description="-1 = leave the TTL unchanged, 0 = remove it (permanent), N > 0 = expire N days from now."),
     ] = -1,
+    remove_tags: Annotated[
+        list[str], Field(description="Tags to remove (case-insensitive).")
+    ] = [],
+    namespace: Annotated[
+        str, Field(description='Move the memory to this namespace ("" = keep).')
+    ] = "",
+    source: Annotated[
+        str, Field(description='New provenance note ("" = keep the current one).')
+    ] = "",
 ) -> dict:
-    """Edit an existing memory: rewrite content, add tags, or change TTL.
+    """Edit an existing memory: content, tags, namespace, source or TTL.
+
+    Prefer this over storing a second, contradicting memory when a fact
+    changes. A change that would make this memory an exact duplicate of
+    another one in the target namespace is refused, and the error names the
+    existing memory.
 
     Returns the updated memory plus "updated_fields" listing what changed.
     """
@@ -247,6 +262,9 @@ def update_memory(
         content=content,
         add_tags=add_tags,
         ttl_days=ttl_days,
+        remove_tags=remove_tags,
+        namespace=namespace,
+        source=source or None,
     )
 
 
@@ -254,9 +272,10 @@ def update_memory(
 def memory_stats() -> dict:
     """Get vault statistics and health information.
 
-    Returns total memories, counts per namespace, how many have an active
-    TTL, database file size in bytes, database path, and the active
-    search_mode ("fts5" or "like" fallback).
+    Returns total memories, counts per namespace, the most used tags (handy
+    to pick tags consistently), how many have an active TTL, database file
+    size and path, schema_version, and the active search_mode ("fts5" or
+    "like" fallback).
     """
     return _call("memory_stats")
 
@@ -289,10 +308,13 @@ def import_memories(
     """Import memories from a previous export_memories call.
 
     Each item needs at least a non-empty "content"; namespace, tags, source,
-    created_at and expires_at are preserved when present. Exact duplicates
-    (same content + namespace) are skipped.
+    created_at, updated_at and expires_at are preserved when present
+    (timestamps with offsets are converted to UTC). Everything is validated
+    first and written in one transaction, so a bad item changes nothing.
+    Exact duplicates (same content + namespace) and items that have already
+    expired are skipped.
 
-    Returns {"imported", "skipped", "total_received", "message"}.
+    Returns {"imported", "skipped", "expired", "total_received", "message"}.
     """
     return _call("import_memories", memories=memories)
 

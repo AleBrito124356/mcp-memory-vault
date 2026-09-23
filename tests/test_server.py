@@ -196,3 +196,22 @@ def test_concurrent_tool_calls_are_all_stored(vault):
     results = _run(go())
     assert not any(_is_error(r) for r in results)
     assert vault.memory_stats()["total_memories"] == 40
+
+
+def test_update_memory_tool_moves_retags_and_refuses_duplicates(vault):
+    alpha = vault.remember("Fact alpha", namespace="n", tags=["Draft", "x"])
+    beta = vault.remember("Fact beta", namespace="n")
+
+    moved = _call(
+        "update_memory",
+        {"memory_id": alpha["id"], "namespace": "archive", "remove_tags": ["draft"], "source": "cleanup"},
+    )
+    assert not _is_error(moved)
+    body = _payload(moved)
+    assert body["namespace"] == "archive"
+    assert body["tags"] == ["x"]
+    assert body["source"] == "cleanup"
+
+    clash = _call("update_memory", {"memory_id": beta["id"], "content": "Fact alpha", "namespace": "archive"})
+    assert _is_error(clash)
+    assert f"Memory {alpha['id']} in namespace 'archive' already says exactly this" in clash.content[0].text
