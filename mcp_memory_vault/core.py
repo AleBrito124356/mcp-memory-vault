@@ -34,11 +34,14 @@ from __future__ import annotations
 import functools
 import json
 import os
+import re
 import sqlite3
 import threading
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 #: Current on-disk schema. 0/1 = v0.1.0 (no indexes, raw timestamps).
 SCHEMA_VERSION = 2
@@ -207,10 +210,143 @@ def _escape_like(term: str) -> str:
     )
 
 
-def _fts_match_expression(query: str) -> str:
-    """Sanitize a raw query into an FTS5 MATCH expression (AND of quoted terms)."""
-    terms = [t for t in query.split() if t]
-    return " ".join('"' + term.replace('"', '""') + '"' for term in terms)
+# ---------------------------------------------------------------------------
+# Query normalisation
+# ---------------------------------------------------------------------------
+
+#: Accepted values for recall(match=...).
+MATCH_MODES = ("auto", "all", "any")
+
+# Words that carry no meaning in a search. Agents phrase recalls as questions
+# ("when does ACME prefer to deploy?"); requiring "when", "does" and "to" to
+# appear in the stored fact made those queries return nothing. Compared after
+# case folding and accent stripping; English + Spanish, deliberately compact.
+_STOPWORDS = frozenset(
+    """
+    a about above after again against all also am an and any are as at be
+    because been before being below between both but by can could did do does
+    doing down during each few for from further get got had has have having he
+    her here hers herself him himself his how i if in into is it its itself
+    just me more most my myself no nor not now of off on once only or other our
+    ours ourselves out over own please same she should so some such than that
+    the their theirs them themselves then there these they this those through
+    to too under until up us very was we were what when where which while who
+    whom whose why will with would you your yours yourself yourselves
+    s t d ll re ve m don doesn didn isn aren wasn weren won wouldn shouldn
+    couldn haven hasn hadn
+    anything something everything thing things stuff info know knows tell
+    remember recall find show
+    al algo algun alguna algunas alguno algunos ante antes aqui asi cada como
+    con contra cual cuales cuando cuanto de del desde donde durante e el ella
+    ellas ello ellos en entre era eran eres es esa esas ese eso esos esta estaba
+    estaban estan estas este esto estos fue fueron ha habia han hasta hay la
+    las le les lo los mas me mi mia mis mucho muy nada ni nos nosotros o os otra
+    otras otro otros para pero poco por porque que quien quienes se sea segun
+    ser si sin sobre son su sus tambien te tengo tiene tienen ti tu tus u un
+    una unas uno unos usted ustedes y ya yo
+    """.split()
+)
+_WORD_RE = re.compile(r"[^\W_]+")  # runs of letters/digits, like FTS5 unicode61
+_MAX_TERMS = 12
+_MIN_PREFIX = 3
+
+
+class QueryTerm(NamedTuple):
+    """One normalised search term."""
+
+    text: str  #: the word as searched (case-folded)
+    root: str  #: shortest form used for prefix matching ("deploys" -> "deplo")
+    prefix: bool  #: whether prefix matching applies (words of 3+ letters)
+
+
+def _fold(word: str) -> str:
+    """Case-fold and strip accents ("Qué" -> "que") for stopword lookup."""
+    decomposed = unicodedata.normalize("NFKD", word.casefold())
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+
+
+def _root(word: str) -> str:
+    """Light, language-agnostic suffix stripping for prefix matching.
+
+    It only needs to produce a prefix that the inflected forms share:
+    "deploys"/"deployed"/"deployment" -> "deplo", "preferred" -> "prefer",
+    "clientes" -> "client". The exact word is always searched as well, so an
+    over-short root can only widen a match, never lose one.
+    """
+    for suffix in ("ing", "ed", "es", "s"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= _MIN_PREFIX:
+            stem = word[: -len(suffix)]
+            if (
+                suffix in ("ing", "ed")
+                and len(stem) > _MIN_PREFIX
+                and stem[-1] == stem[-2]
+                and stem[-1] not in "aeiouls"
+            ):
+                stem = stem[:-1]  # "preferr" -> "prefer", "runn" -> "run"
+            word = stem
+            break
+    if len(word) > _MIN_PREFIX and word[-1] in "ey":
+        word = word[:-1]  # "deploy" -> "deplo" matches deploys AND deployment
+    return word
+
+
+def query_terms(query: str) -> list[QueryTerm]:
+    """Split a free-text query into search terms.
+
+    Splits on anything that is not a letter or digit (so "ACME's" and
+    "deploy?" work), drops stopwords unless nothing else is left, removes
+    repeats and keeps at most 12 terms.
+    """
+    words = [w.casefold() for w in _WORD_RE.findall(query or "")]
+    meaningful = [w for w in words if _fold(w) not in _STOPWORDS]
+    terms: list[QueryTerm] = []
+    seen: set[str] = set()
+    for word in meaningful or words:
+        if word in seen:
+            continue
+        seen.add(word)
+        if len(word) >= _MIN_PREFIX and not word.isdigit():
+            terms.append(QueryTerm(word, _root(word), True))
+        else:
+            terms.append(QueryTerm(word, word, False))
+        if len(terms) == _MAX_TERMS:
+            break
+    return terms
+
+
+def _fts_term(term: QueryTerm) -> str:
+    """FTS5 expression for one term.
+
+    FTS5 runs the porter stemmer over query words too, so the exact word
+    matches its inflections ("retries" ~ "retry"); the root prefix adds forms
+    the stemmer does not unify ("deploy" ~ "deployment").
+    """
+    if not term.prefix:
+        return f'"{term.text}"'
+    if term.root == term.text:
+        return f'"{term.text}"*'
+    return f'("{term.text}" OR "{term.root}"*)'
+
+
+def _like_pattern(term: QueryTerm) -> str:
+    return "%" + _escape_like(term.root if term.prefix else term.text) + "%"
+
+
+def _highlight(content: str, terms: list[QueryTerm]) -> str:
+    """Bracket the words that match a term, like FTS5 snippet() does."""
+    def matches(word: str) -> bool:
+        folded = word.casefold()
+        return any(
+            folded.startswith(t.root) if t.prefix else folded == t.text for t in terms
+        )
+
+    marked = _WORD_RE.sub(lambda m: f"[{m.group(0)}]" if matches(m.group(0)) else m.group(0), content)
+    if len(marked) <= _FALLBACK_SNIPPET_CHARS:
+        return marked
+    first = marked.find("[")
+    start = max(0, first - 40) if first > 0 else 0
+    window = marked[start : start + _FALLBACK_SNIPPET_CHARS]
+    return ("…" if start else "") + window.rstrip() + ("…" if start + _FALLBACK_SNIPPET_CHARS < len(marked) else "")
 
 
 def fts5_supported(conn: sqlite3.Connection) -> bool:
@@ -666,64 +802,164 @@ class MemoryVault:
         namespace: str = "",
         tags: list[str] | None = None,
         limit: int = 8,
+        match: str = "auto",
     ) -> dict:
-        """Full-text search over stored memories, best matches first."""
-        self._purge_expired()
+        """Full-text search over stored memories, best matches first.
+
+        The query is normalised by :func:`query_terms`: punctuation and
+        stopwords are ignored and words of 3+ letters also match by prefix,
+        so "when does ACME prefer to deploy?" searches acme + prefer + deploy.
+
+        match:
+            ``"all"``  every term must match (strict AND).
+            ``"any"``  at least one term must match; memories matching more
+            terms rank first, then by bm25 relevance.
+            ``"auto"`` (default) ``"all"``, falling back to ``"any"`` when
+            nothing matches every term. ``match_mode`` in the result says
+            which one produced the hits.
+
+        Each hit carries ``matched_terms`` and a ``snippet`` with the matched
+        words in [brackets].
+        """
+        if match not in MATCH_MODES:
+            raise ValueError(
+                f"match must be one of {', '.join(MATCH_MODES)} — got {match!r}."
+            )
         if not (query or "").strip():
             raise ValueError(
                 "query must not be empty — pass one or more search terms, or "
                 "use list_memories to browse."
             )
+        self._purge_expired()
         limit = max(1, limit)
         namespace = (namespace or "").strip()
         required_tags = _normalize_tags(tags)
+        terms = query_terms(query)
 
-        if self.fts5_available:
-            rows = self._recall_fts(query, namespace, required_tags, limit)
-        else:
-            rows = self._recall_like(query, namespace, required_tags, limit)
-
-        hits = []
-        for row, snippet in rows:
-            memory = self._row_to_dict(row)
-            memory["snippet"] = snippet
-            hits.append(memory)
-        return {
+        result: dict = {
             "query": query,
+            "terms": [t.text for t in terms],
             "search_mode": self.search_mode,
-            "count": len(hits),
-            "hits": hits,
+            "match_mode": None,
+            "count": 0,
+            "hits": [],
         }
+        if not terms:
+            result["hint"] = (
+                "The query has no searchable words (only punctuation?). Use "
+                "words that would appear in the memory, or list_memories to browse."
+            )
+            return result
 
-    def _recall_fts(self, query, namespace, tags, limit):
-        where, params = self._filters("m.", namespace, tags)
-        sql = f"""
-            SELECT m.*,
-                   snippet(memories_fts, 0, '[', ']', ' … ', {_SNIPPET_TOKENS}) AS snip,
-                   bm25(memories_fts) AS score
-            FROM memories_fts
-            JOIN memories AS m ON m.id = memories_fts.rowid
-            WHERE memories_fts MATCH ? {where}
-            ORDER BY score ASC, m.created_at DESC, m.id DESC
-            LIMIT ?
-        """
-        rows = self._conn.execute(
-            sql, [_fts_match_expression(query), *params, limit]
-        ).fetchall()
-        return [(row, row["snip"]) for row in rows]
+        if match == "auto":
+            modes = ["all", "any"] if len(terms) > 1 else ["all"]
+        else:
+            modes = [match]
+        search = self._search_fts if self.fts5_available else self._search_like
+        for mode in modes:
+            found = search(terms, mode, namespace, required_tags, limit)
+            if found:
+                break
+        result["match_mode"] = mode
 
-    def _recall_like(self, query, namespace, tags, limit):
-        where, params = self._filters("", namespace, tags)
-        terms = [t for t in query.split() if t]
-        like = "".join(" AND content LIKE ? ESCAPE '\\'" for _ in terms)
-        sql = (
-            f"SELECT * FROM memories WHERE 1=1 {like} {where} "
-            "ORDER BY created_at DESC, id DESC LIMIT ?"
+        rows = self._rows_by_id([memory_id for memory_id, _, _ in found])
+        for memory_id, mask, snippet in found:
+            memory = self._row_to_dict(rows[memory_id])
+            memory["snippet"] = snippet
+            memory["matched_terms"] = [t.text for i, t in enumerate(terms) if mask >> i & 1]
+            result["hits"].append(memory)
+        result["count"] = len(result["hits"])
+
+        if not found:
+            result["hint"] = (
+                "Nothing matched. Try fewer or different words (synonyms, the "
+                "customer/project name), drop the tag filter, or browse with "
+                "list_memories."
+            )
+        elif match == "auto" and mode == "any":
+            result["note"] = (
+                "No memory contains every term, so these are partial matches, "
+                "best first — check matched_terms before relying on them."
+            )
+        return result
+
+    def _rows_by_id(self, ids: list[int]) -> dict[int, sqlite3.Row]:
+        if not ids:
+            return {}
+        marks = ",".join("?" * len(ids))
+        rows = self._conn.execute(f"SELECT * FROM memories WHERE id IN ({marks})", ids)
+        return {row["id"]: row for row in rows}
+
+    @staticmethod
+    def _rank_sql(inner: str, n_terms: int, tiebreak: str) -> str:
+        """Order an inner query (exposing ``mask``) by #terms matched first."""
+        matched = " + ".join(f"((mask >> {i}) & 1)" for i in range(n_terms))
+        # "LIMIT -1" stops SQLite from flattening the subquery, which would
+        # re-evaluate the per-term probes behind ``mask`` once per reference.
+        return (
+            f"SELECT * FROM ({inner} LIMIT -1) "
+            f"ORDER BY ({matched}) DESC, {tiebreak}, created_at DESC, id DESC LIMIT ?"
         )
-        rows = self._conn.execute(
-            sql, ["%" + _escape_like(t) + "%" for t in terms] + params + [limit]
+
+    def _search_fts(self, terms, mode, namespace, tags, limit):
+        """Ranked FTS5 search. Returns [(id, matched-term bitmask, snippet)]."""
+        fragments = [_fts_term(t) for t in terms]
+        expression = (" AND " if mode == "all" else " OR ").join(fragments)
+        where, filter_params = self._filters("m.", namespace, tags)
+        if mode == "all" or len(terms) == 1:
+            # Every hit matched every term: no per-term probes needed.
+            mask_sql, mask_params = str((1 << len(terms)) - 1), []
+        else:
+            mask_sql = " | ".join(
+                f"((m.id IN (SELECT rowid FROM memories_fts WHERE memories_fts MATCH ?)) << {i})"
+                for i in range(len(terms))
+            )
+            mask_params = fragments
+        inner = f"""
+            SELECT m.id AS id, m.created_at AS created_at,
+                   bm25(memories_fts) AS score, {mask_sql} AS mask
+            FROM memories_fts JOIN memories AS m ON m.id = memories_fts.rowid
+            WHERE memories_fts MATCH ? {where}
+        """
+        ranked = self._conn.execute(
+            self._rank_sql(inner, len(terms), "score ASC"),
+            [*mask_params, expression, *filter_params, limit],
         ).fetchall()
-        return [(row, _truncate(row["content"], _FALLBACK_SNIPPET_CHARS)) for row in rows]
+        if not ranked:
+            return []
+        # Snippets only for the hits we return (snippet() is the costly part).
+        marks = ",".join("?" * len(ranked))
+        snippets = dict(
+            self._conn.execute(
+                f"""
+                SELECT rowid, snippet(memories_fts, 0, '[', ']', ' … ', {_SNIPPET_TOKENS})
+                FROM memories_fts WHERE memories_fts MATCH ? AND rowid IN ({marks})
+                """,
+                [expression, *(row["id"] for row in ranked)],
+            ).fetchall()
+        )
+        return [(row["id"], row["mask"], snippets.get(row["id"], "")) for row in ranked]
+
+    def _search_like(self, terms, mode, namespace, tags, limit):
+        """Fallback without FTS5: substring match on each term's root.
+
+        Same semantics as FTS5 mode (all/any, prefix roots, matched_terms);
+        ranked by number of matched terms, then recency.
+        """
+        patterns = [_like_pattern(t) for t in terms]
+        like = "content LIKE ? ESCAPE '\\'"
+        condition = (" AND " if mode == "all" else " OR ").join([like] * len(terms))
+        mask_sql = " | ".join(f"(({like}) << {i})" for i in range(len(terms)))
+        where, filter_params = self._filters("", namespace, tags)
+        inner = (
+            f"SELECT id, created_at, content, {mask_sql} AS mask FROM memories "
+            f"WHERE ({condition}) {where}"
+        )
+        ranked = self._conn.execute(
+            self._rank_sql(inner, len(terms), "1"),
+            [*patterns, *patterns, *filter_params, limit],
+        ).fetchall()
+        return [(row["id"], row["mask"], _highlight(row["content"], terms)) for row in ranked]
 
     @_synchronized
     def get_memory(self, memory_id: int) -> dict:

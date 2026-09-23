@@ -17,7 +17,7 @@ Run with: ``mcp-memory-vault`` or ``python -m mcp_memory_vault.server`` (stdio).
 # tool signatures at runtime and choke on string annotations.
 import sqlite3
 import threading
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
@@ -161,27 +161,41 @@ def remember(
 @mcp.tool(title="Search memories", annotations=_READ_ONLY)
 def recall(
     query: Annotated[
-        str, Field(description='Search terms, e.g. "ACME deploy".')
+        str,
+        Field(description='What to look for: key nouns ("ACME deploy") or a plain question ("when does ACME deploy?").'),
     ],
     namespace: Annotated[
         str, Field(description='Only search this namespace ("" = all namespaces).')
     ] = "",
     tags: Annotated[
-        list[str], Field(description="Only return memories carrying ALL of these tags.")
+        list[str], Field(description="Only return memories carrying ALL of these tags (case-insensitive).")
     ] = [],
     limit: Annotated[int, Field(description="Maximum number of hits.")] = 8,
+    match: Annotated[
+        Literal["auto", "all", "any"],
+        Field(
+            description='"all" = every term must match; "any" = at least one, most terms first; '
+            '"auto" = "all", falling back to "any" when nothing matches every term.'
+        ),
+    ] = "auto",
 ) -> dict:
     """Search memories by full text and get the best matches first.
 
-    All query terms must match (AND semantics). Results are ranked by
-    relevance (SQLite FTS5 bm25) with recency as tiebreaker, and each hit
-    includes a highlighted snippet, its tags, and a readable age like
-    "3 days ago".
+    Punctuation and filler words ("when", "does", "the", "de", "que"...) are
+    ignored and words also match by prefix, so plain questions work. With
+    the default match="auto", memories containing every term come first; if
+    none do, partial matches are returned instead, ranked by how many terms
+    they contain, and the result carries a "note" saying so. Ranking uses
+    SQLite FTS5 bm25 relevance with recency as tiebreaker.
 
-    Returns {"query", "search_mode", "count", "hits": [...]} where each hit
-    has id, content, snippet, namespace, tags, source, created_at, age.
+    Returns {"query", "terms", "search_mode", "match_mode", "count", "hits"}
+    where each hit has id, content, snippet (matches in [brackets]),
+    matched_terms, namespace, tags, source, created_at, updated_at and age.
+    A "hint" explains what to try when nothing matched.
     """
-    return _call("recall", query=query, namespace=namespace, tags=tags, limit=limit)
+    return _call(
+        "recall", query=query, namespace=namespace, tags=tags, limit=limit, match=match
+    )
 
 
 @mcp.tool(

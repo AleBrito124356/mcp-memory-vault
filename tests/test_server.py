@@ -215,3 +215,22 @@ def test_update_memory_tool_moves_retags_and_refuses_duplicates(vault):
     clash = _call("update_memory", {"memory_id": beta["id"], "content": "Fact alpha", "namespace": "archive"})
     assert _is_error(clash)
     assert f"Memory {alpha['id']} in namespace 'archive' already says exactly this" in clash.content[0].text
+
+
+def test_recall_tool_understands_questions_and_exposes_match(vault):
+    vault.remember("Customer ACME prefers deploys on Fridays", namespace="support")
+    vault.remember("ACME's billing contact is Jane Doe", namespace="support")
+
+    found = _payload(_call("recall", {"query": "when does ACME prefer to deploy?"}))
+    assert found["match_mode"] == "all"
+    assert found["hits"][0]["content"] == "Customer ACME prefers deploys on Fridays"
+    assert found["hits"][0]["matched_terms"] == ["acme", "prefer", "deploy"]
+
+    partial = _payload(_call("recall", {"query": "ACME's deploy day"}))
+    assert partial["match_mode"] == "any" and "note" in partial
+
+    strict = _payload(_call("recall", {"query": "ACME's deploy day", "match": "all"}))
+    assert strict["count"] == 0 and "hint" in strict
+
+    bad = _call("recall", {"query": "acme", "match": "fuzzy"})
+    assert _is_error(bad)  # rejected by the input schema's enum
