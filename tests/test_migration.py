@@ -160,6 +160,32 @@ def test_out_of_sync_index_is_rebuilt_on_open(tmp_path):
         assert vault.recall("Globex")["count"] == 1
 
 
+def test_rows_written_later_by_v010_are_repaired_on_open(tmp_path):
+    """An old install sharing the file writes rows without tag_index."""
+    path = tmp_path / "shared.db"
+    MemoryVault(db_path=path).close()  # current schema
+    conn = sqlite3.connect(path)
+    conn.execute(  # exactly what 0.1.0's import_memories would write
+        "INSERT INTO memories (content, namespace, tags, source, created_at, expires_at) "
+        "VALUES (?, 'default', ?, '', ?, NULL)",
+        ("Written by 0.1.0", json.dumps(["Legacy"]), "2026-07-21T01:00:00-05:00"),
+    )
+    conn.execute(  # untagged, with an offset TTL: only the timestamp gives it away
+        "INSERT INTO memories (content, created_at, expires_at) VALUES (?, ?, ?)",
+        ("Untagged 0.1.0 row", "2026-07-21T06:00:00Z", "2099-01-01T00:00:00+02:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    with MemoryVault(db_path=path) as vault:
+        assert vault.migration is None
+        listed = vault.list_memories(tag="legacy")["memories"]
+        assert [m["content"] for m in listed] == ["Written by 0.1.0"]
+        assert listed[0]["created_at"] == "2026-07-21T06:00:00Z"
+        untagged = vault.recall("untagged")["hits"][0]
+        assert untagged["expires_at"] == "2098-12-31T22:00:00Z"
+
+
 def test_newer_schema_is_refused(tmp_path):
     path = tmp_path / "future.db"
     conn = sqlite3.connect(path)

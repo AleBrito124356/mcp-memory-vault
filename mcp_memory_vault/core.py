@@ -52,6 +52,7 @@ _FALLBACK_SNIPPET_CHARS = 160
 _BUSY_TIMEOUT_MS = 10_000
 _TAG_SEP = "\x1f"  # unit separator: delimits tags in the tag_index column
 _TOP_TAGS = 15
+_CANONICAL_GLOB = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z"
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +480,9 @@ class MemoryVault:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # WAL + NORMAL: a commit is not fsync'ed individually. Still safe from
+        # corruption; a power cut can only lose the last few commits.
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self.fts5_available = False
         self.fts_rebuilt = False
         self.migration: dict | None = None
@@ -518,6 +522,14 @@ class MemoryVault:
                 )
             if version < SCHEMA_VERSION:
                 self.migration = self._migrate(version)
+            elif self._conn.execute(
+                "SELECT 1 FROM memories WHERE (tag_index = '' AND tags NOT IN ('[]', '')) "
+                "OR created_at NOT GLOB ? OR expires_at NOT GLOB ? LIMIT 1",
+                (_CANONICAL_GLOB, _CANONICAL_GLOB),
+            ).fetchone():
+                # Rows written by an older release sharing this file (it knows
+                # nothing about tag_index): re-derive their normalised fields.
+                self._normalize_rows()
             if fts5:
                 self._ensure_fts(force_rebuild=self.migration is not None)
         self.fts5_available = fts5
