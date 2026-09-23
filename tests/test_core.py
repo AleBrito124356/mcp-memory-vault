@@ -302,13 +302,18 @@ def test_like_fallback(vault, monkeypatch):
     assert result["count"] == 1
     hit = result["hits"][0]
     assert hit["content"] == "Customer ACME prefers deploys on Fridays"
-    # Fallback snippet is the (possibly truncated) content itself.
-    assert hit["snippet"].startswith("Customer ACME")
+    # The fallback snippet brackets matched words, like FTS5's snippet().
+    assert hit["snippet"] == "Customer [ACME] prefers [deploys] on Fridays"
+    assert hit["matched_terms"] == ["acme", "deploy"]
 
     # Namespace and tag filters work in fallback mode too.
     assert vault.recall("deploys", tags=["customer"])["count"] == 1
     assert vault.recall("deploys", namespace="nope")["count"] == 0
 
-    # LIKE wildcards in the query are escaped, not interpreted.
-    assert vault.recall("100%")["count"] == 0
-    assert vault.recall("100")["count"] == 1
+    # Wildcards are never interpreted: punctuation is not part of a search
+    # term, so "100%" searches for "100" and a bare "%" searches for nothing.
+    assert [h["content"] for h in vault.recall("100%")["hits"]] == [
+        "Hooli rate limits their public API at 100 rps"
+    ]
+    nothing = vault.recall("%")
+    assert nothing["count"] == 0 and "no searchable words" in nothing["hint"]

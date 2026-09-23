@@ -1,47 +1,155 @@
 """mcp-memory-vault — MCP server that gives any agent persistent memory.
 
-Entry point: FastMCP wiring only. All logic lives in core.py (pure stdlib).
-Run with: python -m mcp_memory_vault.server  (stdio transport)
+This module is MCP wiring only; all logic lives in :mod:`core` (pure stdlib).
+It runs on both major versions of the official Python SDK:
+
+* ``mcp`` 2.x, where the high-level server is ``mcp.server.mcpserver.MCPServer``
+  and synchronous tools run on worker threads;
+* ``mcp`` 1.x (>= 1.10), where it is ``mcp.server.fastmcp.FastMCP``.
+
+Importing the module has no side effects: the SQLite vault is opened lazily on
+the first tool call, at ``MEMORY_VAULT_DB`` or ``~/.mcp-memory-vault/memories.db``.
+
+Run with: ``mcp-memory-vault`` or ``python -m mcp_memory_vault.server`` (stdio).
 """
 
-from __future__ import annotations
+# No ``from __future__ import annotations`` here: older 1.x SDKs inspect the
+# tool signatures at runtime and choke on string annotations.
+import sqlite3
+import threading
+from typing import Annotated, Any, Literal
 
-from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
+try:  # mcp >= 2.0
+    from mcp.server.mcpserver import MCPServer as _ServerClass
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    MCP_MAJOR = 2
+except ImportError:  # mcp 1.x
+    from mcp.server.fastmcp import FastMCP as _ServerClass
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    MCP_MAJOR = 1
+
+from mcp.types import ToolAnnotations
+
+from . import __version__
 from .core import MemoryVault
 
-mcp = FastMCP("mcp-memory-vault")
-vault = MemoryVault()
+INSTRUCTIONS = """\
+Memory Vault is persistent memory that survives across sessions and conversations.
+
+REMEMBER as soon as you learn something a future session would need: user \
+preferences, decisions and their reasons, project conventions, environment \
+quirks, names/ids/contacts, commitments and follow-ups. Write one \
+self-contained sentence per memory that names its subject ("Customer ACME \
+prefers production deploys on Fridays", not "they prefer Fridays"). Use one \
+namespace per project or user, 1-3 short tags, and ttl_days for context that \
+goes stale. Never store secrets (passwords, API keys, tokens).
+
+RECALL at the start of a task and before asking the user something they may \
+already have told you. Query with the key nouns (people, projects, customers, \
+tools); plain questions work too. If nothing comes back, try fewer or \
+different words, or browse with list_memories.
+
+KEEP IT ACCURATE: when a fact changes, update_memory the existing memory \
+instead of storing a contradicting one, and forget memories that are wrong."""
+
+_server_kwargs: dict[str, Any] = {"instructions": INSTRUCTIONS}
+if MCP_MAJOR >= 2:
+    _server_kwargs["version"] = __version__
+
+mcp = _ServerClass("mcp-memory-vault", **_server_kwargs)
+if MCP_MAJOR == 1 and hasattr(mcp, "_mcp_server"):
+    # FastMCP has no version argument and would report the SDK's version as
+    # serverInfo.version; report ours instead.
+    mcp._mcp_server.version = __version__
+
+_vault: MemoryVault | None = None
+_vault_lock = threading.Lock()
 
 
-@mcp.tool()
+def get_vault() -> MemoryVault:
+    """Return the process-wide vault, opening it on first use."""
+    global _vault
+    if _vault is None:
+        with _vault_lock:
+            if _vault is None:
+                _vault = MemoryVault()
+    return _vault
+
+
+def set_vault(vault: MemoryVault | None) -> MemoryVault | None:
+    """Swap the vault used by the tools (tests, embedding). Returns the old one."""
+    global _vault
+    with _vault_lock:
+        previous, _vault = _vault, vault
+    return previous
+
+
+def _call(method: str, **kwargs: Any) -> dict:
+    """Invoke a vault method, turning anticipated failures into ToolError.
+
+    The SDK only forwards the text of a ``ToolError`` to the model; any other
+    exception is reported as an opaque crash (``Error executing tool ...``).
+    core raises ``ValueError`` with actionable hints ("use list_memories to
+    find valid ids"), so those must reach the model verbatim.
+    """
+    try:
+        return getattr(get_vault(), method)(**kwargs)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from None
+    except sqlite3.OperationalError as exc:
+        raise ToolError(
+            f"The memory database is unavailable ({exc}). Try again in a moment; "
+            "if it keeps failing, run `mcp-memory-vault doctor`."
+        ) from None
+
+
+_READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    title="Remember a fact",
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
+    ),
+)
 def remember(
-    content: str,
-    namespace: str = "default",
-    tags: list[str] = [],
-    ttl_days: int = 0,
-    source: str = "",
+    content: Annotated[
+        str, Field(description="The fact to remember, as one self-contained sentence that names its subject.")
+    ],
+    namespace: Annotated[
+        str, Field(description="Logical bucket, e.g. one per project or user.")
+    ] = "default",
+    tags: Annotated[
+        list[str], Field(description='Optional short labels for filtering, e.g. ["customer", "deploy"].')
+    ] = [],
+    ttl_days: Annotated[
+        int, Field(description="Days until the memory expires; 0 = never expires.")
+    ] = 0,
+    source: Annotated[
+        str, Field(description='Optional provenance, e.g. "user message" or "ticket #123".')
+    ] = "",
 ) -> dict:
     """Store a fact in persistent memory so it survives across sessions.
 
     Use this whenever you learn something worth keeping: user preferences,
     project decisions, environment quirks, follow-ups. Exact duplicates
-    (same content in the same namespace) are detected and returned with
-    "deduplicated": true instead of being stored twice.
+    (same content in the same namespace) are never stored twice: the
+    existing memory is returned with "deduplicated": true, and any new tags
+    are merged into it (listed in "merged_tags"). Tags are case-insensitive.
 
-    Args:
-        content: The fact to remember, as a self-contained sentence.
-        namespace: Logical bucket (e.g. per project or per user). Defaults
-            to "default".
-        tags: Optional labels for later filtering (e.g. ["customer", "deploy"]).
-        ttl_days: Days until the memory expires. 0 = never expires.
-        source: Optional provenance note (e.g. "support ticket #123").
-
-    Returns:
-        The stored memory (id, content, namespace, tags, timestamps) plus
-        "deduplicated" and a human-readable "message".
+    Returns the stored memory (id, content, namespace, tags, timestamps) plus
+    "deduplicated", "merged_tags" and a human-readable "message".
     """
-    return vault.remember(
+    return _call(
+        "remember",
         content=content,
         namespace=namespace,
         tags=tags,
@@ -50,135 +158,183 @@ def remember(
     )
 
 
-@mcp.tool()
+@mcp.tool(title="Search memories", annotations=_READ_ONLY)
 def recall(
-    query: str,
-    namespace: str = "",
-    tags: list[str] = [],
-    limit: int = 8,
+    query: Annotated[
+        str,
+        Field(description='What to look for: key nouns ("ACME deploy") or a plain question ("when does ACME deploy?").'),
+    ],
+    namespace: Annotated[
+        str, Field(description='Only search this namespace ("" = all namespaces).')
+    ] = "",
+    tags: Annotated[
+        list[str], Field(description="Only return memories carrying ALL of these tags (case-insensitive).")
+    ] = [],
+    limit: Annotated[int, Field(description="Maximum number of hits.")] = 8,
+    match: Annotated[
+        Literal["auto", "all", "any"],
+        Field(
+            description='"all" = every term must match; "any" = at least one, most terms first; '
+            '"auto" = "all", falling back to "any" when nothing matches every term.'
+        ),
+    ] = "auto",
 ) -> dict:
     """Search memories by full text and get the best matches first.
 
-    All query terms must match (AND semantics). Results are ranked by
-    relevance (SQLite FTS5 bm25) with recency as tiebreaker, and each hit
-    includes a highlighted snippet, its tags, and a readable age like
-    "3 days ago".
+    Punctuation and filler words ("when", "does", "the", "de", "que"...) are
+    ignored and words also match by prefix, so plain questions work. With
+    the default match="auto", memories containing every term come first; if
+    none do, partial matches are returned instead, ranked by how many terms
+    they contain, and the result carries a "note" saying so. Ranking uses
+    SQLite FTS5 bm25 relevance with recency as tiebreaker.
 
-    Args:
-        query: One or more search terms, e.g. "ACME deploy".
-        namespace: Restrict the search to one namespace ("" = all).
-        tags: Only return memories carrying ALL of these tags.
-        limit: Maximum number of hits to return (default 8).
-
-    Returns:
-        {"query", "search_mode", "count", "hits": [...]} where each hit has
-        id, content, snippet, namespace, tags, source, created_at, age.
+    Returns {"query", "terms", "search_mode", "match_mode", "count", "hits"}
+    where each hit has id, content, snippet (matches in [brackets]),
+    matched_terms, namespace, tags, source, created_at, updated_at and age.
+    A "hint" explains what to try when nothing matched.
     """
-    return vault.recall(query=query, namespace=namespace, tags=tags, limit=limit)
+    return _call(
+        "recall", query=query, namespace=namespace, tags=tags, limit=limit, match=match
+    )
 
 
-@mcp.tool()
-def forget(memory_id: int) -> dict:
+@mcp.tool(
+    title="Forget a memory",
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
+    ),
+)
+def forget(
+    memory_id: Annotated[
+        int, Field(description="Id of the memory to delete (from recall or list_memories).")
+    ],
+) -> dict:
     """Permanently delete one memory by id.
 
-    Args:
-        memory_id: The id of the memory to delete (from recall or
-            list_memories).
-
-    Returns:
-        Confirmation with the id and a truncated preview of what was deleted.
+    Returns confirmation with the id and a truncated preview of what was
+    deleted.
     """
-    return vault.forget(memory_id=memory_id)
+    return _call("forget", memory_id=memory_id)
 
 
-@mcp.tool()
-def list_memories(namespace: str = "", tag: str = "", limit: int = 20) -> dict:
+@mcp.tool(title="List memories", annotations=_READ_ONLY)
+def list_memories(
+    namespace: Annotated[
+        str, Field(description='Only list this namespace ("" = all).')
+    ] = "",
+    tag: Annotated[str, Field(description='Only list memories with this tag ("" = any).')] = "",
+    limit: Annotated[int, Field(description="Maximum number of memories.")] = 20,
+) -> dict:
     """Browse stored memories, most recent first, without a search query.
 
-    Args:
-        namespace: Only list memories in this namespace ("" = all).
-        tag: Only list memories carrying this tag ("" = any).
-        limit: Maximum number of memories to return (default 20).
-
-    Returns:
-        {"count", "memories": [...]} with expires_at included when a TTL
-        is set.
+    Returns {"count", "memories": [...]} with expires_at included when a TTL
+    is set.
     """
-    return vault.list_memories(namespace=namespace, tag=tag, limit=limit)
+    return _call("list_memories", namespace=namespace, tag=tag, limit=limit)
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Update a memory",
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False
+    ),
+)
 def update_memory(
-    memory_id: int,
-    content: str = "",
-    add_tags: list[str] = [],
-    ttl_days: int = -1,
+    memory_id: Annotated[int, Field(description="Id of the memory to update.")],
+    content: Annotated[
+        str, Field(description='New content ("" = keep the current content).')
+    ] = "",
+    add_tags: Annotated[
+        list[str], Field(description="Tags to add on top of the existing ones.")
+    ] = [],
+    ttl_days: Annotated[
+        int,
+        Field(description="-1 = leave the TTL unchanged, 0 = remove it (permanent), N > 0 = expire N days from now."),
+    ] = -1,
+    remove_tags: Annotated[
+        list[str], Field(description="Tags to remove (case-insensitive).")
+    ] = [],
+    namespace: Annotated[
+        str, Field(description='Move the memory to this namespace ("" = keep).')
+    ] = "",
+    source: Annotated[
+        str, Field(description='New provenance note ("" = keep the current one).')
+    ] = "",
 ) -> dict:
-    """Edit an existing memory: rewrite content, add tags, or change TTL.
+    """Edit an existing memory: content, tags, namespace, source or TTL.
 
-    Args:
-        memory_id: The id of the memory to update.
-        content: New content ("" = keep current content).
-        add_tags: Tags to add on top of the existing ones.
-        ttl_days: -1 = leave TTL unchanged, 0 = remove TTL (make permanent),
-            any positive value = expire that many days from now.
+    Prefer this over storing a second, contradicting memory when a fact
+    changes. A change that would make this memory an exact duplicate of
+    another one in the target namespace is refused, and the error names the
+    existing memory.
 
-    Returns:
-        The updated memory plus "updated_fields" listing what changed.
+    Returns the updated memory plus "updated_fields" listing what changed.
     """
-    return vault.update_memory(
+    return _call(
+        "update_memory",
         memory_id=memory_id,
         content=content,
         add_tags=add_tags,
         ttl_days=ttl_days,
+        remove_tags=remove_tags,
+        namespace=namespace,
+        source=source or None,
     )
 
 
-@mcp.tool()
+@mcp.tool(title="Vault statistics", annotations=_READ_ONLY)
 def memory_stats() -> dict:
     """Get vault statistics and health information.
 
-    Returns:
-        Total memories, counts per namespace, how many have an active TTL,
-        database file size in bytes, database path, and the active
-        search_mode ("fts5" or "like" fallback).
+    Returns total memories, counts per namespace, the most used tags (handy
+    to pick tags consistently), how many have an active TTL, database file
+    size and path, schema_version, and the active search_mode ("fts5" or
+    "like" fallback).
     """
-    return vault.memory_stats()
+    return _call("memory_stats")
 
 
-@mcp.tool()
-def export_memories(namespace: str = "") -> dict:
+@mcp.tool(title="Export memories", annotations=_READ_ONLY)
+def export_memories(
+    namespace: Annotated[
+        str, Field(description='Only export this namespace ("" = everything).')
+    ] = "",
+) -> dict:
     """Export memories as JSON-serializable dicts for backup or migration.
 
-    Args:
-        namespace: Only export this namespace ("" = export everything).
-
-    Returns:
-        {"count", "namespace", "memories": [...]} — feed the "memories"
-        array to import_memories on another vault to migrate.
+    Returns {"count", "namespace", "memories": [...]}; feed the "memories"
+    array to import_memories on another vault to migrate.
     """
-    return vault.export_memories(namespace=namespace)
+    return _call("export_memories", namespace=namespace)
 
 
-@mcp.tool()
-def import_memories(memories: list[dict]) -> dict:
+@mcp.tool(
+    title="Import memories",
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
+    ),
+)
+def import_memories(
+    memories: Annotated[
+        list[dict], Field(description='The "memories" array produced by export_memories.')
+    ],
+) -> dict:
     """Import memories from a previous export_memories call.
 
-    Each item needs at least a non-empty "content"; namespace, tags,
-    source, created_at, and expires_at are preserved when present. Exact
-    duplicates (same content + namespace) are skipped.
+    Each item needs at least a non-empty "content"; namespace, tags, source,
+    created_at, updated_at and expires_at are preserved when present
+    (timestamps with offsets are converted to UTC). Everything is validated
+    first and written in one transaction, so a bad item changes nothing.
+    Exact duplicates (same content + namespace) and items that have already
+    expired are skipped.
 
-    Args:
-        memories: The "memories" array produced by export_memories.
-
-    Returns:
-        {"imported", "skipped", "total_received", "message"}.
+    Returns {"imported", "skipped", "expired", "total_received", "message"}.
     """
-    return vault.import_memories(memories=memories)
+    return _call("import_memories", memories=memories)
 
 
 def main() -> None:
-    """Entry point for the console script."""
+    """Run the MCP server over stdio."""
     mcp.run()
 
 
