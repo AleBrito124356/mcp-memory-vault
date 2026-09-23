@@ -38,7 +38,7 @@ Source = "https://github.com/AleBrito124356/mcp-memory-vault"
 Issues = "https://github.com/AleBrito124356/mcp-memory-vault/issues"
 
 [project.scripts]
-mcp-memory-vault = "mcp_memory_vault.server:main"
+mcp-memory-vault = "mcp_memory_vault.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mcp_memory_vault"]
