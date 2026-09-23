@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "mcp-memory-vault"
 version = "0.2.0"
-description = "MCP server that gives any agent persistent memory — namespaced facts with tags, SQLite FTS5 full-text search, TTL expiry and zero external dependencies."
+description = "MCP server that gives any agent persistent memory: namespaced facts with tags, SQLite FTS5 search that understands plain questions, TTL expiry and a CLI to inspect and back up the vault. Local only."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
