@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-memory-vault"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server that gives any agent persistent memory — namespaced facts with tags, SQLite FTS5 full-text search, TTL expiry and zero external dependencies."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,10 +20,14 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Database",
 ]
-dependencies = ["mcp>=1.2.0"]
+# mcp 1.10 is the first release with tool titles; 2.x renamed FastMCP to
+# MCPServer, and server.py supports both. The upper bound keeps a future
+# breaking major from being resolved before it has been tested.
+dependencies = ["mcp>=1.10,<3", "pydantic>=2.7"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]

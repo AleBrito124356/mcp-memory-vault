@@ -3,7 +3,7 @@
   "name": "io.github.AleBrito124356/mcp-memory-vault",
   "title": "Memory Vault",
   "description": "Persistent memory for agents: namespaced facts, tags, SQLite FTS5 search and TTL expiry.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "repository": {
     "url": "https://github.com/AleBrito124356/mcp-memory-vault",
     "source": "github"
@@ -13,7 +13,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "mcp-memory-vault",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "runtimeHint": "uvx",
       "transport": {"type": "stdio"},
       "environmentVariables": [

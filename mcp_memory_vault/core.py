@@ -10,19 +10,28 @@ LIKE search (AND semantics) and reports ``"search_mode": "like"`` in
 Storage lives in ``~/.mcp-memory-vault/memories.db`` by default; override
 with the ``MEMORY_VAULT_DB`` environment variable or by passing an
 explicit ``db_path`` to :class:`MemoryVault`.
+
+Thread safety: one :class:`MemoryVault` owns one SQLite connection, and every
+public method runs under a re-entrant lock, so a single instance can be shared
+by the worker threads an MCP SDK uses to run synchronous tools. Separate
+processes (two agents, or an agent plus the CLI) coordinate through SQLite's
+own locking, with a busy timeout instead of failing on the first contention.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 _TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _SNIPPET_TOKENS = 12
 _FALLBACK_SNIPPET_CHARS = 160
+_BUSY_TIMEOUT_MS = 10_000
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +128,22 @@ def _fts_match_expression(query: str) -> str:
     return " ".join('"' + term.replace('"', '""') + '"' for term in terms)
 
 
+def _synchronized(method):
+    """Run a MemoryVault method while holding the instance lock.
+
+    ``sqlite3`` connections are not safe to use from several threads at once:
+    interleaved statements corrupt cursor state and lose writes. The lock is
+    re-entrant so public methods may call each other.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 # ---------------------------------------------------------------------------
 # MemoryVault
 # ---------------------------------------------------------------------------
@@ -133,8 +158,14 @@ class MemoryVault:
             )
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(
+            str(self.db_path),
+            check_same_thread=False,
+            timeout=_BUSY_TIMEOUT_MS / 1000,
+        )
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         self._conn.execute("PRAGMA journal_mode=WAL")
         self.fts5_available = True
         self._init_schema()
@@ -238,6 +269,7 @@ class MemoryVault:
 
     # -- tools --------------------------------------------------------------
 
+    @_synchronized
     def remember(
         self,
         content: str,
@@ -299,6 +331,7 @@ class MemoryVault:
         result["message"] = f"Stored memory {row['id']} in namespace '{namespace}'."
         return result
 
+    @_synchronized
     def recall(
         self,
         query: str,
@@ -372,6 +405,7 @@ class MemoryVault:
         rows = self._conn.execute(sql, params).fetchall()
         return [(row, _truncate(row["content"], _FALLBACK_SNIPPET_CHARS)) for row in rows]
 
+    @_synchronized
     def forget(self, memory_id: int) -> dict:
         """Delete a memory by id, confirming what was removed."""
         self._purge_expired()
@@ -386,6 +420,7 @@ class MemoryVault:
             "message": f"Forgot memory {memory_id}: {_truncate(row['content'])}",
         }
 
+    @_synchronized
     def list_memories(
         self, namespace: str = "", tag: str = "", limit: int = 20
     ) -> dict:
@@ -414,6 +449,7 @@ class MemoryVault:
                 break
         return {"count": len(memories), "memories": memories}
 
+    @_synchronized
     def update_memory(
         self,
         memory_id: int,
@@ -484,6 +520,7 @@ class MemoryVault:
         )
         return result
 
+    @_synchronized
     def memory_stats(self) -> dict:
         """Vault statistics: totals, namespaces, TTL usage, size, search mode."""
         self._purge_expired()
@@ -511,6 +548,7 @@ class MemoryVault:
             "search_mode": self.search_mode,
         }
 
+    @_synchronized
     def export_memories(self, namespace: str = "") -> dict:
         """Export memories as plain JSON-serializable dicts (for backup)."""
         self._purge_expired()
@@ -529,6 +567,7 @@ class MemoryVault:
             "memories": memories,
         }
 
+    @_synchronized
     def import_memories(self, memories: list[dict]) -> dict:
         """Import memories previously produced by export_memories.
 
@@ -622,6 +661,13 @@ class MemoryVault:
             "message": f"Imported {imported} memories, skipped {skipped} duplicates.",
         }
 
+    @_synchronized
     def close(self) -> None:
         """Close the underlying SQLite connection."""
         self._conn.close()
+
+    def __enter__(self) -> "MemoryVault":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()

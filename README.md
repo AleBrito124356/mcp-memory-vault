@@ -3,8 +3,8 @@
 <!-- mcp-name: io.github.AleBrito124356/mcp-memory-vault -->
 
 [![tests](https://github.com/AleBrito124356/mcp-memory-vault/actions/workflows/tests.yml/badge.svg)](https://github.com/AleBrito124356/mcp-memory-vault/actions/workflows/tests.yml)
-[![PyPI](https://img.shields.io/pypi/v/mcp-memory-vault)](https://pypi.org/project/mcp-memory-vault/)
-[![Python](https://img.shields.io/pypi/pyversions/mcp-memory-vault)](https://pypi.org/project/mcp-memory-vault/)
+![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)
+![MCP SDK](https://img.shields.io/badge/mcp%20SDK-1.10%2B%20%7C%202.x-6f42c1)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 **MCP server that gives any agent persistent memory — namespaced facts with tags, SQLite FTS5 full-text search, TTL expiry and zero external dependencies.**
@@ -30,7 +30,7 @@ Agents forget everything the moment a session ends. User preferences, project de
 
 ```mermaid
 flowchart LR
-    A[Agent / MCP client] -- stdio --> S[server.py<br/>FastMCP wiring]
+    A[Agent / MCP client] -- stdio --> S[server.py<br/>MCP SDK 1.x or 2.x]
     S --> C[core.py<br/>MemoryVault]
     C -- "purge expired (every op)" --> DB[(SQLite WAL<br/>~/.mcp-memory-vault/memories.db)]
     DB -- triggers keep in sync --> FTS[FTS5 index<br/>memories_fts]
@@ -42,7 +42,13 @@ Every read or write first purges expired rows, so TTLs need no background proces
 
 ## Quickstart
 
-No install needed — `uvx` fetches and runs it:
+mcp-memory-vault is installed straight from GitHub (it is not on PyPI yet, see below). Any MCP client that can launch a stdio command works.
+
+**Claude Code** (with [uv](https://docs.astral.sh/uv/)):
+
+```bash
+claude mcp add memory-vault -- uvx --from git+https://github.com/AleBrito124356/mcp-memory-vault mcp-memory-vault
+```
 
 **Claude Desktop** (`claude_desktop_config.json`):
 
@@ -51,19 +57,22 @@ No install needed — `uvx` fetches and runs it:
   "mcpServers": {
     "memory-vault": {
       "command": "uvx",
-      "args": ["mcp-memory-vault"]
+      "args": ["--from", "git+https://github.com/AleBrito124356/mcp-memory-vault", "mcp-memory-vault"]
     }
   }
 }
 ```
 
-**Claude Code:**
+**Without uv**, install it into any Python 3.10+ environment and point your client at the `mcp-memory-vault` command:
 
 ```bash
-claude mcp add memory-vault -- uvx mcp-memory-vault
+pip install git+https://github.com/AleBrito124356/mcp-memory-vault
+mcp-memory-vault            # speaks MCP over stdio; clients launch it for you
 ```
 
-Prefer a permanent install? `pip install mcp-memory-vault`, then use `mcp-memory-vault` as the command.
+The server works with both major versions of the official `mcp` SDK (1.10+ and 2.x), so it can share an environment with other MCP tooling.
+
+> **PyPI:** publication is pending. The `publish` workflow releases to PyPI (and `server.json` describes the package for the official MCP registry) when a `v*` tag is pushed; until then `uvx mcp-memory-vault` and `pip install mcp-memory-vault` will not find the package.
 
 ## Example session
 
@@ -98,13 +107,19 @@ A support agent learns something today and uses it next week — in a completely
 ```bash
 git clone https://github.com/AleBrito124356/mcp-memory-vault
 cd mcp-memory-vault
+python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 python -m pytest
+python -m mcp_memory_vault.server               # run the stdio server from the source tree
 ```
 
-The server can also be run straight from the source tree with `python -m mcp_memory_vault.server`.
+The suite covers three layers:
 
-Tests exercise `mcp_memory_vault/core.py` directly and run without the `mcp` package installed.
+- `tests/test_core.py`, `tests/test_concurrency.py`: the storage engine, including 8 threads sharing one vault. They need only the standard library.
+- `tests/test_server.py`: every tool through a real in-memory MCP client session, including the error path (the model must see messages like "Memory 999 not found ... use list_memories").
+- `tests/test_stdio_e2e.py`: spawns `python -m mcp_memory_vault.server` and speaks raw JSON-RPC over stdio, exactly like Claude Desktop does.
+
+The server tests run against whichever `mcp` is installed; run the suite once with `pip install "mcp<2"` and once with `pip install "mcp>=2,<3"` to cover both SDK generations.
 
 ## Related MCP servers
 
